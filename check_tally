@@ -1,0 +1,220 @@
+#!/bin/bash 
+
+#  PATH
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+export PATH
+
+#  Variables
+CHKPATH=/var/spool/tally
+
+# Default WARN
+WARN=10
+
+# Default CRIT
+CRIT=20
+
+#  Rollover (Reset) Tally at value
+ROLL=500
+
+# Umask
+umask 027
+
+#  Default user
+U=root
+
+#  Logging
+DEBUG=false
+LOGLEVEL=1
+
+#  Check command line args
+while getopts ":w:c:u:h?dU" opt;
+do
+    case $opt in
+      w)
+	  WARN=$OPTARG
+	  ;;
+      c)
+	  CRIT=$OPTARG
+	  ;;
+      u)
+	  U=$OPTARG
+	  ;;
+      h|?)
+	  echo "check_tally [ -U ] [ -u USER ] [ -w WARNING ] [ -c CRITICAL ] [ -d ] "
+	  echo -e "\n  -U           Update tally logs.   You need to do this each minute in crontab"
+	  echo -e "\n  -u USER      Tally for USER.  Can be used with or without -U.  Default root"
+	  echo -e "\n  -w WARNING   Set Nagios WARNING level of failed logins/H.  Default 10, Minimum 1."
+	  echo -e "\n  -c CRITICAL  Set Nagios CRITICAL level of failed logins/H.  Default 20, Minimum 2."
+	  echo -e "\n  -d           Write additional Debug information in logs"
+	  exit 0
+	  ;;
+      d)
+          DEBUG=true
+          ;;
+      U)
+	  UPDATEONLY="true"
+	  ;;
+    esac
+done
+
+#  Validate WARN/CRIT
+if [ $WARN -lt 1 ];then
+  WARN=1
+fi
+if [ $CRIT -lt 2 ];then
+  CRIT=2
+fi
+
+#  Validate user
+id $U >/dev/null 2>&1
+if [ $? -eq 0 ];then
+  CHKPATH=$CHKPATH/$U
+  LOG=/var/log/check_tally_$U.log
+else
+  echo `date "+%y/%m/%d-%H:%M"`"  : check_tally unknown user $U" |tee -a /var/log/messages
+  exit 1
+fi
+
+# Calculate Current Minute, Hour, Tally.
+Perm=0;Perh=0
+CurrMin=`date +%M`
+CurrHour=`date +%H`
+CurrTally=`pam_tally2 --user=$U |grep $U|awk '{print $2}'`
+
+#  Setup Dir, cleanup
+if [ "$UPDATEONLY" = "true" ];then
+  if [ ! -d $CHKPATH ];then
+    echo `date "+%y/%m/%d-%H:%M"`"  : First run,  Reset all." >>$LOG
+    pam_tally2 --user=$U --reset
+    mkdir -p $CHKPATH
+    CurrTally=0
+  fi
+
+  # Cleanup old entries
+  find $CHKPATH -name RESETTING -mmin +61 -exec rm {} \;
+  find $CHKPATH -type f -mmin +240 -exec rm {} \;
+fi
+
+
+# Write to log
+if [ "$UPDATEONLY" = "true" ];then
+  echo `date "+%y/%m/%d-%H:%M"`"  : $U:Update,  Tally:$CurrTally" >>$LOG
+  echo $CurrTally >$CHKPATH/${CurrHour}_$CurrMin.log
+else
+  echo `date "+%y/%m/%d-%H:%M"`"  : $U:Check,  Tally:$CurrTally  CRIT:$CRIT   WARN:$WARN" >>$LOG
+fi
+
+
+#  Load RESETTING value
+if [ -f $CHKPATH/RESETTING ];then
+  RESETTING=`cat $CHKPATH/RESETTING 2>/dev/null`
+  echo `date "+%y/%m/%d-%H:%M"`"  : $U:   RESETTING:$RESETTING" >>$LOG
+else
+  RESETTING=0
+fi
+
+
+#
+# Calculate last Min
+#
+LH=$CurrHour
+LM=`expr $CurrMin - 1`
+if [[ $LM -lt 0 ]];then
+  LM=59
+  LH=`expr $CurrHour - 1`
+  if [[ $LH -lt 0 ]];then
+    LH=23
+  fi
+fi
+
+LastHour=`echo 0$LH|sed 's/.*\(..\)$/\1/'`
+LastMin=`echo 0$LM|sed 's/.*\(..\)$/\1/'`
+
+if [ -f $CHKPATH/${LastHour}_$LastMin.log ];then
+  LastTallyM=`cat $CHKPATH/${LastHour}_$LastMin.log 2>/dev/null`
+fi
+
+if [[ $LastTallyM = "" ]];then
+  LastTallyM=0
+fi
+
+# Calculate Tally/min
+Perm=`expr $CurrTally - $LastTallyM`
+if [ "$DEBUG" = "true" ];then
+  echo `date "+%y/%m/%d-%H:%M"`"  : $U:   $Perm =  $CurrTally - $LastTallyM (Perm=Curr-LastM)" >>$LOG
+fi
+
+
+
+
+
+
+#
+# Calculate last Hour
+#
+LH=`expr $CurrHour - 1`
+LastHour=`echo 0$LH|sed 's/.*\(..\)$/\1/'`
+if [[ $LH -lt 0 ]];then
+  LastHour=23
+fi
+
+if [ -f $CHKPATH/${LastHour}_$CurrMin.log ];then
+  LastTallyH=`cat $CHKPATH/${LastHour}_$CurrMin.log 2>/dev/null`
+else
+  LastTallyH=0
+fi
+
+#
+#  Delete RESETTING value if expired
+#
+if [ $LastTallyH = "000" -a "$UPDATEONLY" = "true" ];then   # Found Flag
+  rm -f $CHKPATH/RESETTING 2>/dev/null
+  RESETTING=0
+  echo `date "+%y/%m/%d-%H:%M"`"  : $U:   RESETTING: Delete" >>$LOG
+fi
+
+
+# Calculate Tally/h
+Perh=`expr $CurrTally - $LastTallyH + $RESETTING` 
+if [ "$DEBUG" = "true" ];then
+  echo `date "+%y/%m/%d-%H:%M"`"  : $U:   $Perh =  $CurrTally - $LastTallyH + $RESETTING (Perh=Curr-LastH+RESETTING)" >>$LOG
+fi
+
+
+
+
+
+
+#
+#  Reset Tally  
+#
+if [ $CurrTally -gt $ROLL -a "$UPDATEONLY" = "true" ];then
+  echo `date "+%y/%m/%d-%H:%M"`"  : $U:   Tally RESET:$CurrTally" >>$LOG
+  pam_tally2 --user=$U --reset
+  echo $CurrTally >$CHKPATH/RESETTING
+  echo "000" >$CHKPATH/${CurrHour}_$CurrMin.log   # Flag
+fi
+
+
+#
+#  output for Nagios
+#
+CODE="OK" ; CD=0
+
+if [ $Perh -gt $WARN ];then
+  CODE="WARNING" ;CD=1
+fi
+if [ $Perh -gt $CRIT ];then
+  CODE="CRITICAL" ;CD=2
+fi
+
+# Output results to nagios and log
+if [ "$UPDATEONLY" = "true" ];then
+  echo `date "+%y/%m/%d-%H:%M"`"  : $U:   BadLogin/Hr=$Perh; BadLogin/Min=$Perm;" >>$LOG
+else
+  echo "CHECK_TALLY $CODE - $Perh | BadLogin/Hr=$Perh; BadLogin/Min=$Perm;" 
+  echo `date "+%y/%m/%d-%H:%M"`"  : $U:   CHECK_TALLY $CODE - $Perh | BadLogin/Hr=$Perh; BadLogin/Min=$Perm;" >>$LOG
+fi
+
+exit $CD
+
